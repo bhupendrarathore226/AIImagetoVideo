@@ -13,6 +13,9 @@ Supports three backends, configured via the VIDEO_BACKEND environment variable:
 │ huggingface_local    │ SVD XT (local GPU, HuggingFace)      │ ~16 GB VRAM + diffusers   │
 └──────────────────────┴──────────────────────────────────────┴───────────────────────────┘
 
+The Replicate backends use the REST API directly via httpx — no third-party
+replicate package required. This ensures Python 3.14 compatibility.
+
 SVD (Stable Video Diffusion) generates 25 frames of smooth, natural motion from a
 still image. The text prompt is parsed for motion-intensity keywords and mapped to
 SVD's `motion_bucket_id` parameter (1–255).
@@ -22,13 +25,21 @@ the generated motion.
 """
 
 import asyncio
+import base64
 import logging
 import os
 import uuid
 
+import httpx
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# Replicate REST API base URL
+REPLICATE_API_BASE = "https://api.replicate.com/v1"
+
+# Seconds to wait between prediction status polls
+POLL_INTERVAL = 3
 
 
 class VideoGenerator:
@@ -74,10 +85,11 @@ class VideoGenerator:
 
     async def _generate_replicate(self, image_path: str, prompt: str) -> str:
         """
-        Submit a generation request to the Replicate cloud API.
+        Submit a generation request to the Replicate cloud REST API.
 
-        The image is pre-processed (resized / cropped) to SVD's expected
-        1024×576 resolution before upload.
+        The image is:
+        1. Pre-processed (resized / cropped) to SVD's expected resolution.
+        2. Base64-encoded and sent as a data URI — no separate upload step.
         """
         if not self.replicate_token:
             raise RuntimeError(
@@ -92,16 +104,10 @@ class VideoGenerator:
 
         try:
             if self.backend == "replicate_svd":
-                output = await asyncio.to_thread(
-                    self._run_svd_replicate, processed_path, prompt
-                )
+                video_url = await self._run_svd_replicate(processed_path, prompt)
             else:  # replicate_minimax
-                output = await asyncio.to_thread(
-                    self._run_minimax_replicate, processed_path, prompt
-                )
+                video_url = await self._run_minimax_replicate(processed_path, prompt)
 
-            # Replicate returns a FileOutput object; get its URL
-            video_url = output.url if hasattr(output, "url") else str(output)
             await self._download_video(video_url, output_path)
 
         finally:
@@ -110,23 +116,25 @@ class VideoGenerator:
 
         return output_path
 
-    def _run_svd_replicate(self, image_path: str, prompt: str):
+    async def _run_svd_replicate(self, image_path: str, prompt: str) -> str:
         """
-        Call stability-ai/stable-video-diffusion on Replicate.
+        Call stability-ai/stable-video-diffusion on Replicate via REST API.
 
         SVD generates 25 frames of smooth animation from a single image.
         It does not understand text prompts directly — instead we map
         motion-intensity keywords to `motion_bucket_id` (1–255).
-        """
-        import replicate
 
+        Returns the URL of the generated video.
+        """
         motion_bucket = self._prompt_to_motion_bucket(prompt)
         logger.info(f"SVD — motion_bucket_id={motion_bucket}")
 
-        output = replicate.run(
-            "stability-ai/stable-video-diffusion",
-            input={
-                "input_image": open(image_path, "rb"),
+        data_uri = await asyncio.to_thread(self._encode_image_to_data_uri, image_path)
+
+        prediction = await self._create_replicate_prediction(
+            model="stability-ai/stable-video-diffusion",
+            input_payload={
+                "input_image": data_uri,
                 # Controls camera + object motion (1 = still, 255 = very dynamic)
                 "motion_bucket_id": motion_bucket,
                 # Conditioning augmentation — small values give cleaner output
@@ -137,28 +145,96 @@ class VideoGenerator:
                 "decoding_t": 14,
             },
         )
-        return output
 
-    def _run_minimax_replicate(self, image_path: str, prompt: str):
+        output = prediction["output"]
+        if isinstance(output, list):
+            return str(output[0])
+        return str(output)
+
+    async def _run_minimax_replicate(self, image_path: str, prompt: str) -> str:
         """
-        Call minimax/video-01 on Replicate.
+        Call minimax/video-01 on Replicate via REST API.
 
         Minimax Video-01 is a full multimodal model that accepts both an image
         (first frame anchor) and a text prompt for guided animation.
-        """
-        import replicate
 
+        Returns the URL of the generated video.
+        """
         effective_prompt = prompt.strip() or "smooth natural camera movement, cinematic"
         logger.info(f"Minimax Video-01 — prompt='{effective_prompt}'")
 
-        output = replicate.run(
-            "minimax/video-01",
-            input={
+        data_uri = await asyncio.to_thread(self._encode_image_to_data_uri, image_path)
+
+        prediction = await self._create_replicate_prediction(
+            model="minimax/video-01",
+            input_payload={
                 "prompt": effective_prompt,
-                "first_frame_image": open(image_path, "rb"),
+                "first_frame_image": data_uri,
             },
         )
-        return output
+
+        output = prediction["output"]
+        if isinstance(output, list):
+            return str(output[0])
+        return str(output)
+
+    async def _create_replicate_prediction(self, model: str, input_payload: dict) -> dict:
+        """
+        Create a Replicate prediction and poll until it succeeds or fails.
+
+        Uses the latest deployed version of the model via:
+          POST /v1/models/{owner}/{name}/predictions
+
+        Polls every POLL_INTERVAL seconds until the status is terminal.
+        """
+        headers = {
+            "Authorization": f"Token {self.replicate_token}",
+            "Content-Type": "application/json",
+            "Prefer": "wait=60",  # Ask Replicate to wait up to 60s before returning
+        }
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # ── Create prediction ────────────────────────────────────────────
+            create_url = f"{REPLICATE_API_BASE}/models/{model}/predictions"
+            logger.info(f"Creating Replicate prediction: {create_url}")
+
+            response = await client.post(
+                create_url,
+                headers=headers,
+                json={"input": input_payload},
+            )
+
+            if response.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Replicate API error {response.status_code}: {response.text}"
+                )
+
+            prediction = response.json()
+            logger.info(
+                f"Prediction created — id={prediction.get('id')} "
+                f"status={prediction.get('status')}"
+            )
+
+            # ── Poll until terminal status ───────────────────────────────────
+            poll_headers = {"Authorization": f"Token {self.replicate_token}"}
+
+            while prediction.get("status") not in ("succeeded", "failed", "canceled"):
+                await asyncio.sleep(POLL_INTERVAL)
+
+                poll_response = await client.get(
+                    f"{REPLICATE_API_BASE}/predictions/{prediction['id']}",
+                    headers=poll_headers,
+                )
+                poll_response.raise_for_status()
+                prediction = poll_response.json()
+                logger.info(f"Prediction status: {prediction.get('status')}")
+
+            if prediction["status"] != "succeeded":
+                error_msg = prediction.get("error") or "Unknown error from Replicate"
+                raise RuntimeError(f"Replicate prediction failed: {error_msg}")
+
+            logger.info("Prediction succeeded")
+            return prediction
 
     # ──────────────────────────────────────────────────────────────────────────
     # Local HuggingFace backend
@@ -256,6 +332,27 @@ class VideoGenerator:
             return 60
         return 127
 
+    def _encode_image_to_data_uri(self, image_path: str) -> str:
+        """
+        Read the image file and return a base64-encoded data URI.
+
+        This lets us send the image directly to the Replicate API without
+        needing a publicly accessible URL or a separate file-upload step.
+        """
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }
+        mime_type = mime_map.get(ext, "image/png")
+
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        return f"data:{mime_type};base64,{encoded}"
+
     def _resize_image(self, image_path: str) -> str:
         """
         Resize and center-crop the image to SVD's expected dimensions.
@@ -290,9 +387,7 @@ class VideoGenerator:
 
     async def _download_video(self, url: str, output_path: str) -> None:
         """Stream-download a video from a URL to a local file."""
-        import httpx
-
-        logger.info(f"Downloading video from Replicate…")
+        logger.info("Downloading video from Replicate…")
         async with httpx.AsyncClient(timeout=300.0) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()

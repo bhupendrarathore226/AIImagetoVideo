@@ -1,22 +1,22 @@
 # ── Core API framework ─────────────────────────────────────────────────────────
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
-python-multipart==0.0.9
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
-python-dotenv==1.0.1
-httpx==0.27.0
-Pillow==10.2.0
+python-dotenv>=1.0.1
+httpx>=0.28.0
+Pillow>=11.0.0
 
 # ── AI Backend: Replicate (cloud, default — no GPU required) ───────────────────
+# Calls the Replicate REST API directly via httpx (no replicate package needed).
 # Sign up for a free account at https://replicate.com
-replicate==0.25.1
 
 # ── AI Backend: HuggingFace Local (optional — requires ~16 GB VRAM GPU) ────────
 # Uncomment the lines below to enable on-device inference.
 # Install PyTorch first: https://pytorch.org/get-started/locally/
 #
 # torch>=2.2.0
-# diffusers==0.26.3
-# transformers==4.37.2
-# accelerate==0.27.2
+# diffusers>=0.26.3
+# transformers>=4.37.2
+# accelerate>=0.27.2
