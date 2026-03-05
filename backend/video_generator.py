@@ -223,7 +223,9 @@ class VideoGenerator:
                     json={"version": version_id, "input": input_payload},
                 )
 
-            if response.status_code not in (200, 201):
+            # 200/201 = prediction complete or created synchronously
+            # 202 = prediction accepted but Prefer: wait timeout elapsed — poll below
+            if response.status_code not in (200, 201, 202):
                 raise RuntimeError(
                     f"Replicate API error {response.status_code}: {response.text}"
                 )

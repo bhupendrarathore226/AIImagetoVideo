@@ -96,3 +96,4 @@ async def generate_video(
         # Always clean up the uploaded source image
         if os.path.exists(image_path):
             os.remove(image_path)
+

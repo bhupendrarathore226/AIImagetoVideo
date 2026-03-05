@@ -268,3 +268,6 @@ uvicorn main:app --reload --port 8001
 pip install torch
 pip install diffusers transformers accelerate
 ```
+# From the backend folder:
+& "e:\AI Project\AIImagetoVideo\.venv\Scripts\Activate.ps1"
+uvicorn main:app --reload
