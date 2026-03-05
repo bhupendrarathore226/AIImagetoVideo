@@ -8,8 +8,8 @@ Supports three backends, configured via the VIDEO_BACKEND environment variable:
 ┌──────────────────────┬──────────────────────────────────────┬───────────────────────────┐
 │ VIDEO_BACKEND value  │ Model                                │ Requirements              │
 ├──────────────────────┼──────────────────────────────────────┼───────────────────────────┤
-│ replicate_svd        │ Stable Video Diffusion (Replicate)   │ REPLICATE_API_TOKEN       │
 │ replicate_minimax    │ Minimax Video-01 (Replicate)         │ REPLICATE_API_TOKEN       │
+│ replicate_svd        │ WAN 2.1 Image-to-Video (Replicate)   │ REPLICATE_API_TOKEN       │
 │ huggingface_local    │ SVD XT (local GPU, HuggingFace)      │ ~16 GB VRAM + diffusers   │
 └──────────────────────┴──────────────────────────────────────┴───────────────────────────┘
 
@@ -118,31 +118,29 @@ class VideoGenerator:
 
     async def _run_svd_replicate(self, image_path: str, prompt: str) -> str:
         """
-        Call stability-ai/stable-video-diffusion on Replicate via REST API.
+        Call wan-video/wan2.1-i2v-480p on Replicate via REST API.
 
-        SVD generates 25 frames of smooth animation from a single image.
-        It does not understand text prompts directly — instead we map
-        motion-intensity keywords to `motion_bucket_id` (1–255).
+        WAN 2.1 (Image-to-Video) is an open-source image-to-video model that
+        accepts both an image and an optional text prompt.
+
+        Note: stability-ai/stable-video-diffusion was removed from Replicate.
+        WAN 2.1 is its recommended open-source replacement.
 
         Returns the URL of the generated video.
         """
-        motion_bucket = self._prompt_to_motion_bucket(prompt)
-        logger.info(f"SVD — motion_bucket_id={motion_bucket}")
+        effective_prompt = prompt.strip() or "smooth natural motion, cinematic"
+        logger.info(f"WAN 2.1 i2v — prompt='{effective_prompt}'")
 
         data_uri = await asyncio.to_thread(self._encode_image_to_data_uri, image_path)
 
         prediction = await self._create_replicate_prediction(
-            model="stability-ai/stable-video-diffusion",
+            model="wan-video/wan2.1-i2v-480p",
             input_payload={
-                "input_image": data_uri,
-                # Controls camera + object motion (1 = still, 255 = very dynamic)
-                "motion_bucket_id": motion_bucket,
-                # Conditioning augmentation — small values give cleaner output
-                "cond_aug": 0.02,
-                "sizing_strategy": "maintain_aspect_ratio",
-                "frames_per_second": 6,
-                "video_length": "25_frames_with_svd_xt",
-                "decoding_t": 14,
+                "image": data_uri,
+                "prompt": effective_prompt,
+                "num_frames": 81,       # ~3.3 seconds at 24 fps
+                "sample_steps": 20,
+                "fast_mode": "Balanced",
             },
         )
 
