@@ -182,27 +182,48 @@ class VideoGenerator:
         """
         Create a Replicate prediction and poll until it succeeds or fails.
 
-        Uses the latest deployed version of the model via:
-          POST /v1/models/{owner}/{name}/predictions
+        Strategy:
+        1. Try POST /v1/models/{owner}/{name}/predictions  (latest-deployment endpoint)
+        2. If that returns 404, the model has no active deployment — fall back to:
+             a. GET  /v1/models/{owner}/{name}/versions  → fetch latest version hash
+             b. POST /v1/predictions  with {"version": <hash>, "input": ...}
 
-        Polls every POLL_INTERVAL seconds until the status is terminal.
+        This handles both Replicate "official deployment" models and
+        community/legacy models that only expose versioned endpoints.
         """
-        headers = {
-            "Authorization": f"Token {self.replicate_token}",
+        auth_headers = {"Authorization": f"Token {self.replicate_token}"}
+        post_headers = {
+            **auth_headers,
             "Content-Type": "application/json",
-            "Prefer": "wait=60",  # Ask Replicate to wait up to 60s before returning
+            "Prefer": "wait=60",  # Ask Replicate to wait up to 60s before responding
         }
 
         async with httpx.AsyncClient(timeout=300.0) as client:
-            # ── Create prediction ────────────────────────────────────────────
-            create_url = f"{REPLICATE_API_BASE}/models/{model}/predictions"
-            logger.info(f"Creating Replicate prediction: {create_url}")
+
+            # ── Step 1: try the model-deployment endpoint ────────────────────
+            model_url = f"{REPLICATE_API_BASE}/models/{model}/predictions"
+            logger.info(f"Attempting model-deployment endpoint: {model_url}")
 
             response = await client.post(
-                create_url,
-                headers=headers,
+                model_url,
+                headers=post_headers,
                 json={"input": input_payload},
             )
+
+            # ── Step 2: 404 → fall back to versioned endpoint ────────────────
+            if response.status_code == 404:
+                logger.info(
+                    f"Model deployment not found (404). "
+                    f"Fetching latest version hash for {model}…"
+                )
+                version_id = await self._get_latest_model_version(client, model)
+                logger.info(f"Using version: {version_id}")
+
+                response = await client.post(
+                    f"{REPLICATE_API_BASE}/predictions",
+                    headers=post_headers,
+                    json={"version": version_id, "input": input_payload},
+                )
 
             if response.status_code not in (200, 201):
                 raise RuntimeError(
@@ -215,15 +236,13 @@ class VideoGenerator:
                 f"status={prediction.get('status')}"
             )
 
-            # ── Poll until terminal status ───────────────────────────────────
-            poll_headers = {"Authorization": f"Token {self.replicate_token}"}
-
+            # ── Step 3: poll until terminal status ───────────────────────────
             while prediction.get("status") not in ("succeeded", "failed", "canceled"):
                 await asyncio.sleep(POLL_INTERVAL)
 
                 poll_response = await client.get(
                     f"{REPLICATE_API_BASE}/predictions/{prediction['id']}",
-                    headers=poll_headers,
+                    headers=auth_headers,
                 )
                 poll_response.raise_for_status()
                 prediction = poll_response.json()
@@ -235,6 +254,39 @@ class VideoGenerator:
 
             logger.info("Prediction succeeded")
             return prediction
+
+    async def _get_latest_model_version(
+        self, client: httpx.AsyncClient, model: str
+    ) -> str:
+        """
+        Fetch the latest version hash for a model from the Replicate API.
+
+        GET /v1/models/{owner}/{name}/versions returns results sorted newest-first.
+        """
+        url = f"{REPLICATE_API_BASE}/models/{model}/versions"
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Token {self.replicate_token}"},
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Could not fetch versions for '{model}' "
+                f"({response.status_code}): {response.text}"
+            )
+
+        data = response.json()
+        versions = data.get("results", [])
+
+        if not versions:
+            raise RuntimeError(
+                f"No versions found for model '{model}'. "
+                "The model may have been removed from Replicate."
+            )
+
+        latest = versions[0]["id"]
+        logger.info(f"Latest version for {model}: {latest}")
+        return latest
 
     # ──────────────────────────────────────────────────────────────────────────
     # Local HuggingFace backend

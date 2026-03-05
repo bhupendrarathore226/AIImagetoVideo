@@ -11,14 +11,16 @@ import logging
 import os
 
 from dotenv import load_dotenv
+
+# Load environment variables FIRST — before any app imports so that
+# os.getenv() calls in routes.py / video_generator.py see the values.
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from routes import router
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(
