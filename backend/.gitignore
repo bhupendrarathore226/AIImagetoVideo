@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables (never commit secrets!)
+.env
+
+# Generated video files
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user

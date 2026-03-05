@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+backend/.venv/
+backend/venv/
+backend/env/
+
+# Secrets — never commit!
+backend/.env
+
+# Generated videos
+backend/temp/*.mp4
+backend/temp/*.webm
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
