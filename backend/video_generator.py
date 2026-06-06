@@ -9,8 +9,9 @@ Supports three backends, configured via the VIDEO_BACKEND environment variable:
 │ VIDEO_BACKEND value  │ Model                                │ Requirements              │
 ├──────────────────────┼──────────────────────────────────────┼───────────────────────────┤
 │ replicate_minimax    │ Minimax Video-01 (Replicate)         │ REPLICATE_API_TOKEN       │
-│ replicate_svd        │ WAN 2.1 Image-to-Video (Replicate)   │ REPLICATE_API_TOKEN       │
+│ replicate_svd        │ WAN 2.2 Image-to-Video Fast (Replicate) │ REPLICATE_API_TOKEN    │
 │ huggingface_local    │ SVD XT (local GPU, HuggingFace)      │ ~16 GB VRAM + diffusers   │
+│ comfyui              │ WAN 2.2 i2v (local ComfyUI server)   │ ComfyUI + WAN 2.2 models  │
 └──────────────────────┴──────────────────────────────────────┴───────────────────────────┘
 
 The Replicate backends use the REST API directly via httpx — no third-party
@@ -48,6 +49,12 @@ class VideoGenerator:
         self.replicate_token = os.getenv("REPLICATE_API_TOKEN", "")
         self.hf_token = os.getenv("HF_TOKEN", "")
 
+        # ComfyUI settings (only used when backend == "comfyui")
+        self.comfyui_url = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+        self.comfyui_wan_model = os.getenv("COMFYUI_WAN_MODEL", "wan2.2_i2v_480p_14B_bf16.safetensors")
+        self.comfyui_wan_clip = os.getenv("COMFYUI_WAN_CLIP", "umt5-xxl-enc-bf16.safetensors")
+        self.comfyui_wan_vae = os.getenv("COMFYUI_WAN_VAE", "wan_2.2_vae.safetensors")
+
         # Local pipeline is loaded lazily on first use (only for huggingface_local)
         self._local_pipeline = None
 
@@ -73,10 +80,12 @@ class VideoGenerator:
             return await self._generate_replicate(image_path, prompt)
         elif self.backend == "huggingface_local":
             return await self._generate_local(image_path, prompt)
+        elif self.backend == "comfyui":
+            return await self._generate_comfyui(image_path, prompt)
         else:
             raise ValueError(
                 f"Unknown VIDEO_BACKEND='{self.backend}'. "
-                "Choose: replicate_svd | replicate_minimax | huggingface_local"
+                "Choose: replicate_svd | replicate_minimax | huggingface_local | comfyui"
             )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -118,29 +127,26 @@ class VideoGenerator:
 
     async def _run_svd_replicate(self, image_path: str, prompt: str) -> str:
         """
-        Call wan-video/wan2.1-i2v-480p on Replicate via REST API.
+        Call wan-video/wan-2.2-i2v-fast on Replicate via REST API.
 
-        WAN 2.1 (Image-to-Video) is an open-source image-to-video model that
-        accepts both an image and an optional text prompt.
-
-        Note: stability-ai/stable-video-diffusion was removed from Replicate.
-        WAN 2.1 is its recommended open-source replacement.
+        WAN 2.2 i2v-fast is a PrunaAI-optimised version of Wan 2.2 A14B
+        image-to-video — faster and cheaper than the full model.
 
         Returns the URL of the generated video.
         """
         effective_prompt = prompt.strip() or "smooth natural motion, cinematic"
-        logger.info(f"WAN 2.1 i2v — prompt='{effective_prompt}'")
+        logger.info(f"WAN 2.2 i2v-fast — prompt='{effective_prompt}'")
 
         data_uri = await asyncio.to_thread(self._encode_image_to_data_uri, image_path)
 
         prediction = await self._create_replicate_prediction(
-            model="wan-video/wan2.1-i2v-480p",
+            model="wan-video/wan-2.2-i2v-fast",
             input_payload={
                 "image": data_uri,
                 "prompt": effective_prompt,
-                "num_frames": 81,       # ~3.3 seconds at 24 fps
-                "sample_steps": 20,
-                "fast_mode": "Balanced",
+                "num_frames": 81,       # ~5 seconds at 16 fps
+                "go_fast": True,
+                "resolution": "480p",
             },
         )
 
@@ -348,6 +354,208 @@ class VideoGenerator:
 
         logger.info(f"Local video exported → {output_path}")
         return output_path
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ComfyUI backend
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _generate_comfyui(self, image_path: str, prompt: str) -> str:
+        """
+        Generate video via a locally-running ComfyUI server.
+
+        Flow:
+          1. Upload source image  →  POST /upload/image
+          2. Submit WAN 2.2 i2v workflow  →  POST /prompt
+          3. Poll until complete  →  GET /history/{prompt_id}
+          4. Stream-download output  →  GET /view
+        """
+        effective_prompt = prompt.strip() or "smooth natural motion, cinematic"
+        logger.info(f"ComfyUI WAN 2.2 i2v — prompt='{effective_prompt}'")
+
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            # Step 1 — upload image
+            uploaded_name = await self._comfyui_upload_image(client, image_path)
+            logger.info(f"ComfyUI image uploaded: {uploaded_name}")
+
+            # Step 2 — submit workflow
+            workflow = self._build_wan_i2v_workflow(uploaded_name, effective_prompt)
+            client_id = str(uuid.uuid4())
+            resp = await client.post(
+                f"{self.comfyui_url}/prompt",
+                json={"prompt": workflow, "client_id": client_id},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"ComfyUI /prompt error {resp.status_code}: {resp.text}"
+                )
+            prompt_id = resp.json()["prompt_id"]
+            logger.info(f"ComfyUI prompt queued — id={prompt_id}")
+
+            # Step 3 — poll history
+            output_info = await self._comfyui_poll_history(client, prompt_id)
+
+            # Step 4 — download video
+            output_path = f"temp/video_{uuid.uuid4()}.mp4"
+            view_url = (
+                f"{self.comfyui_url}/view"
+                f"?filename={output_info['filename']}"
+                f"&subfolder={output_info.get('subfolder', '')}"
+                f"&type=output"
+            )
+            await self._download_video(view_url, output_path)
+
+        return output_path
+
+    async def _comfyui_upload_image(
+        self, client: httpx.AsyncClient, image_path: str
+    ) -> str:
+        """Upload an image to ComfyUI and return the filename it was stored as."""
+        with open(image_path, "rb") as f:
+            files = {"image": (os.path.basename(image_path), f, "image/png")}
+            resp = await client.post(
+                f"{self.comfyui_url}/upload/image",
+                files=files,
+                data={"overwrite": "true"},
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"ComfyUI image upload failed {resp.status_code}: {resp.text}"
+            )
+        return resp.json()["name"]
+
+    async def _comfyui_poll_history(
+        self, client: httpx.AsyncClient, prompt_id: str
+    ) -> dict:
+        """
+        Poll GET /history/{prompt_id} until the job is complete.
+        Returns the first video output info dict with keys: filename, subfolder.
+        """
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
+            resp = await client.get(f"{self.comfyui_url}/history/{prompt_id}")
+            resp.raise_for_status()
+            data = resp.json()
+
+            if prompt_id not in data:
+                continue  # not finished yet
+
+            job = data[prompt_id]
+            status = job.get("status", {})
+
+            if status.get("status_str") == "error" or status.get("completed") is False:
+                messages = status.get("messages", [])
+                raise RuntimeError(f"ComfyUI job failed: {messages}")
+
+            # Walk all node outputs to find the first video file
+            for node_output in job.get("outputs", {}).values():
+                for vid in node_output.get("videos", []):
+                    logger.info(f"ComfyUI output video: {vid}")
+                    return vid
+                for gif in node_output.get("gifs", []):
+                    logger.info(f"ComfyUI output gif: {gif}")
+                    return gif
+
+            # outputs present but no video yet — keep polling
+            if status.get("completed"):
+                raise RuntimeError(
+                    "ComfyUI job completed but produced no video output. "
+                    "Check that VHS_VideoCombine (ComfyUI-VideoHelperSuite) is installed."
+                )
+
+    def _build_wan_i2v_workflow(self, image_name: str, prompt: str) -> dict:
+        """
+        Build a WAN 2.2 image-to-video ComfyUI workflow dict.
+
+        Node layout:
+          1  UNETLoader          — WAN 2.2 i2v unet
+          2  CLIPLoader          — UMT5 text encoder
+          3  VAELoader           — WAN 2.2 VAE
+          4  CLIPTextEncode      — positive prompt
+          5  CLIPTextEncode      — negative prompt
+          6  LoadImage           — source image
+          7  WanImageToVideoLatent — i2v latent conditioning
+          8  KSampler            — diffusion sampling
+          9  VAEDecode           — decode latents → frames
+          10 VHS_VideoCombine    — export MP4
+        """
+        return {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {
+                    "unet_name": self.comfyui_wan_model,
+                    "weight_dtype": "default",
+                },
+            },
+            "2": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": self.comfyui_wan_clip,
+                    "type": "wan",
+                    "device": "default",
+                },
+            },
+            "3": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": self.comfyui_wan_vae},
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": prompt, "clip": ["2", 0]},
+            },
+            "5": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": "worst quality, low quality, blurry, distorted",
+                    "clip": ["2", 0],
+                },
+            },
+            "6": {
+                "class_type": "LoadImage",
+                "inputs": {"image": image_name},
+            },
+            "7": {
+                "class_type": "WanImageToVideoLatent",
+                "inputs": {
+                    "width": 832,
+                    "height": 480,
+                    "num_frames": 81,
+                    "batch_size": 1,
+                    "image": ["6", 0],
+                    "vae": ["3", 0],
+                },
+            },
+            "8": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 0,
+                    "steps": 20,
+                    "cfg": 6.0,
+                    "sampler_name": "dpmpp_2m_sde",
+                    "scheduler": "linear_quadratic",
+                    "denoise": 1.0,
+                    "model": ["1", 0],
+                    "positive": ["4", 0],
+                    "negative": ["5", 0],
+                    "latent_image": ["7", 0],
+                },
+            },
+            "9": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["8", 0], "vae": ["3", 0]},
+            },
+            "10": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "frame_rate": 16,
+                    "loop_count": 0,
+                    "filename_prefix": "wan_i2v",
+                    "format": "video/h264-mp4",
+                    "pingpong": False,
+                    "save_output": True,
+                    "images": ["9", 0],
+                },
+            },
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Utility helpers

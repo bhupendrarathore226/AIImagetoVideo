@@ -1,0 +1,128 @@
+================================================================
+  AI IMAGE TO VIDEO PROJECT - STATUS REPORT
+  Date: May 29, 2026
+================================================================
+
+----------------------------------------------------------------
+COMPLETED WORK
+----------------------------------------------------------------
+
+[x] Backend Setup
+    - FastAPI backend running on port 8000
+    - Python venv configured at .venv/
+    - Hot-reload enabled via uvicorn
+    - Entry point: backend/main.py
+
+[x] Frontend Setup
+    - React + Vite + TypeScript frontend running on port 5173
+    - Tailwind CSS configured
+    - API calls via frontend/src/api/videoApi.ts -> POST /api/generate
+
+[x] Replicate API Integration
+    - REPLICATE_API_TOKEN set in backend/.env
+    - Model upgraded from WAN 2.1 -> WAN 2.2 i2v-fast
+    - Model slug: wan-video/wan-2.2-i2v-fast
+    - Input params updated: go_fast=True, resolution="480p"
+    - Old params removed: sample_steps, fast_mode
+
+[x] Multiple Backend Support
+    - VIDEO_BACKEND env var controls which AI backend is used
+    - Supported backends:
+        replicate_svd    -> WAN 2.2 fast (Replicate cloud)
+        replicate_minimax -> Minimax (Replicate cloud)
+        huggingface_local -> SVD XT (local HuggingFace)
+        comfyui          -> WAN 2.2 (local ComfyUI)
+
+[x] ComfyUI Backend Code (fully implemented)
+    - _generate_comfyui() method in video_generator.py
+    - _comfyui_upload_image() - uploads image to ComfyUI
+    - _comfyui_poll_history() - polls for job completion
+    - _build_wan_i2v_workflow() - builds WAN 2.2 ComfyUI workflow
+    - Workflow nodes: UNETLoader, CLIPLoader, VAELoader,
+      CLIPTextEncode, LoadImage, WanImageToVideoLatent,
+      KSampler, VAEDecode, VHS_VideoCombine
+    - ComfyUI env vars added:
+        COMFYUI_URL=http://127.0.0.1:8188
+        COMFYUI_WAN_MODEL=wan2.2_i2v_480p_14B_bf16.safetensors
+        COMFYUI_WAN_CLIP=umt5-xxl-enc-bf16.safetensors
+        COMFYUI_WAN_VAE=wan_2.2_vae.safetensors
+
+[x] Environment Configuration
+    - backend/.env created and configured
+    - backend/.env.example updated with full documentation
+    - VIDEO_BACKEND currently set to: comfyui
+
+[x] NSFW Audit
+    - Reviewed routes.py, video_generator.py, videoApi.ts
+    - No code-level NSFW filter implemented (confirmed)
+    - Replicate platform enforces its own content policy
+    - File validation: MIME type check + file size limit only
+
+----------------------------------------------------------------
+PENDING WORK
+----------------------------------------------------------------
+
+[ ] HARDWARE - Blocker for ComfyUI
+    - Current machine: Intel HD Graphics 620 (1 GB VRAM)
+    - Cannot run ComfyUI locally (needs CUDA + 12 GB VRAM)
+    - Need to purchase new laptop with:
+        GPU:  RTX 5070 Ti or RTX 4080 (12 GB VRAM minimum)
+        RAM:  32 GB minimum (64 GB ideal)
+        CPU:  Intel Core i9 or AMD Ryzen 9
+        SSD:  1 TB minimum (WAN 2.2 model = ~28 GB alone)
+    - Recommended: ASUS ROG Strix G18 2025 (RTX 5070 Ti, 32 GB)
+
+[ ] IMMEDIATE FIX NEEDED - App is broken right now
+    - VIDEO_BACKEND=comfyui in .env
+    - ComfyUI is NOT installed/running
+    - All generation requests will fail with connection error
+    - Fix: Change VIDEO_BACKEND=replicate_svd in backend/.env
+      to restore working state until new laptop arrives
+
+[ ] ComfyUI Installation (after new laptop)
+    Step 1: git clone https://github.com/comfyanonymous/ComfyUI.git
+    Step 2: pip install torch torchvision --index-url
+            https://download.pytorch.org/whl/cu121
+    Step 3: pip install -r ComfyUI/requirements.txt
+    Step 4: Install custom node ComfyUI-VideoHelperSuite
+            (for VHS_VideoCombine / MP4 export)
+    Step 5: Download WAN 2.2 model files to ComfyUI/models/:
+            - models/unet/wan2.2_i2v_480p_14B_bf16.safetensors
+            - models/clip/umt5-xxl-enc-bf16.safetensors
+            - models/vae/wan_2.2_vae.safetensors
+    Step 6: Start ComfyUI: python main.py --port 8188
+    Step 7: Set VIDEO_BACKEND=comfyui in backend/.env
+    Step 8: App works with zero API costs
+
+[ ] NSFW Filter (optional enhancement)
+    - No content moderation implemented in codebase
+    - Consider adding if app will be public-facing:
+        Option A: Use NudeNet or CLIP-based classifier on upload
+        Option B: Add Replicate's moderation model as pre-check
+        Option C: Keep relying on Replicate platform policy
+
+[ ] Video History Persistence (optional)
+    - VideoHistory.tsx component exists in frontend
+    - No backend storage implemented (videos not saved to DB)
+    - Currently stored only in browser session memory
+
+[ ] Production Deployment (future)
+    - No Docker/containerization set up
+    - No CI/CD pipeline
+    - No authentication/user accounts
+    - No rate limiting beyond file size check
+
+----------------------------------------------------------------
+CURRENT STATE SUMMARY
+----------------------------------------------------------------
+
+Backend:   RUNNING  (port 8000, uvicorn hot-reload)
+Frontend:  RUNNING  (port 5173, Vite dev server)
+AI Model:  BROKEN   (VIDEO_BACKEND=comfyui, ComfyUI not installed)
+
+To restore working app NOW:
+  Edit backend/.env
+  Change: VIDEO_BACKEND=comfyui
+  To:     VIDEO_BACKEND=replicate_svd
+
+================================================================
